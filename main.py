@@ -48,9 +48,7 @@ def format_time(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d}.{ms:03d}"
 
 
-def load_gigaam_model(
-    revision: str = "e2e_rnnt",
-) -> Any:
+def load_gigaam_model() -> Any:
     """
     Load GigaAM model and force CPU mode.
     """
@@ -61,7 +59,6 @@ def load_gigaam_model(
         trust_remote_code=True,
     )
 
-    # Принудительно переводим модель на CPU
     model = model.to("cpu", dtype=torch.float32)
     return model
 
@@ -137,7 +134,6 @@ def save_segments_to_json(
 def process_video(
     video_path: str,
     out_dir: str = "outputs",
-    revision: str = "e2e_rnnt",
     save_json: bool = True,
 ) -> None:
     """
@@ -205,12 +201,7 @@ def main() -> None:
         default="outputs",
         help="Directory to save output files",
     )
-    parser.add_argument(
-        "--revision",
-        type=str,
-        default="e2e_rnnt",
-        help="GigaAM-v3 revision",
-    )
+
     parser.add_argument(
         "--no-json",
         action="store_true",
@@ -222,7 +213,6 @@ def main() -> None:
     process_video(
         video_path=args.video_path,
         out_dir=args.out_dir,
-        revision=args.revision,
         save_json=not args.no_json,
     )
 

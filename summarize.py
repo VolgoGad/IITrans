@@ -4,7 +4,6 @@ from pathlib import Path
 from llama_cpp import Llama
 from tqdm import tqdm
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 def get_transcription_text(file_path: str) -> str:
     if file_path.endswith(".json"):
@@ -40,7 +39,7 @@ def split_text_into_chunks(text: str, max_chars: int = 4500) -> list[str]:
         chunks.append(current_chunk.strip())
     return chunks
 
-def generate_summary(transcription_text: str, model_path: str = None) -> str:
+def generate_summary(transcription_text: str) -> str:
     llm = Llama.from_pretrained(
         repo_id="IlyaGusev/saiga_llama3_8b_gguf",
         filename="model-q8_0.gguf",

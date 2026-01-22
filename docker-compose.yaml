@@ -8,7 +8,9 @@ services:
       - ./hf_cache/:/root/.cache
     env_file:
       - .env
-    command: ["data/input.mkv"]
+    environment:
+      - PYTHONUNBUFFERED=1
+    command: ["python3", "-u", "main.py", "data/input.mkv"]
     network_mode: "host"
 
 volumes:

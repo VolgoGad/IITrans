@@ -17,5 +17,3 @@ COPY . .
 # Optional: cache dir for HF models inside container
 ENV TRANSFORMERS_CACHE=/app/hf_cache
 ENV HF_HOME=/app/hf_cache
-
-ENTRYPOINT [ "python", "main.py" ]
