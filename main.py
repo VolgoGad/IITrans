@@ -57,7 +57,7 @@ def load_gigaam_model(
     import torch
 
     model = AutoModel.from_pretrained(
-        "/app/model/",
+        "ai-sage/GigaAM-v3",
         trust_remote_code=True,
     )
 
@@ -152,8 +152,8 @@ def process_video(
     docx_path = out_dir_path / f"{stem}.docx"
     json_path = out_dir_path / f"{stem}.json"
 
-    print(f"[1/4] Extracting audio from {video_path} -> {wav_path}")
-    extract_audio_from_mp4(video_path, str(wav_path))
+    # print(f"[1/4] Extracting audio from {video_path} -> {wav_path}")
+    # extract_audio_from_mp4(video_path, str(wav_path))
 
     print(f"[2/4] Loading GigaAM-v3 model (CPU mode)")
     model = load_gigaam_model()
@@ -178,8 +178,7 @@ def process_video(
         transcription_for_summary = str(json_path) if save_json else str(txt_path)
         full_text = get_transcription_text(transcription_for_summary)
         summary = generate_summary(
-            transcription_text=full_text,
-            model_path="/app/model/Qwen2-1.5B-Instruct.Q6_K_M.gguf"
+            transcription_text=full_text
         )
         save_summary(str(summary_txt_path), summary)
         print(f"SUMMARY saved to: {summary_txt_path}")

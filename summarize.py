@@ -2,6 +2,7 @@ import os
 import json
 from pathlib import Path
 from llama_cpp import Llama
+from tqdm import tqdm
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
@@ -39,15 +40,11 @@ def split_text_into_chunks(text: str, max_chars: int = 4500) -> list[str]:
         chunks.append(current_chunk.strip())
     return chunks
 
-def generate_summary(transcription_text: str, model_path: str) -> str:
-    llm = Llama(
-        model_path=model_path,
-        n_ctx=4096,
-        n_threads=12,
-        n_gpu_layers=0,
-        verbose=False
+def generate_summary(transcription_text: str, model_path: str = None) -> str:
+    llm = Llama.from_pretrained(
+        repo_id="IlyaGusev/saiga_llama3_8b_gguf",
+        filename="model-q8_0.gguf",
     )
-    
     chunks = split_text_into_chunks(transcription_text, max_chars=4500)
     print(f"Разбито на {len(chunks)} фрагментов")
     
@@ -57,12 +54,13 @@ def generate_summary(transcription_text: str, model_path: str) -> str:
     # Начинаем с пустого списка
     current_summary = ""
     
-    for i, chunk in enumerate(chunks):
+    for i, chunk in enumerate(tqdm(chunks)):
         print(f"Обработка фрагмента {i+1}/{len(chunks)}...")
         
-        prompt = f"Суммаризируй текст, сохраняя основные положения из предыдущего резюме:\n"
+        prompt = f"Суммаризируй текст беседы, сохраняя основные положения из предыдущего резюме. "
+        "Выдели основные темы/вопросы и их решения\n"
         f"===Предыдущее резюме===\n{current_summary}"
-        f"===Текущий текст===\n{chunk}"
+        f"===Текущий текст беседы===\n{chunk}"
         
         messages = [{"role": "user", "content": prompt}]
         response = llm.create_chat_completion(
