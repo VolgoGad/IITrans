@@ -9,7 +9,7 @@ services:
       - data_cache:/root/.cache
     env_file:
       - .env
-    command: ["python", "main.py", "data/input.mkv"]
+    command: ["data/input.mkv"]
     network_mode: "host"
     deploy:
       resources:

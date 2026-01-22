@@ -25,8 +25,8 @@ def get_transcription_text(file_path: str) -> str:
     else:
         raise ValueError("Only .txt and .json supported")
 
-def split_text_into_chunks(text: str, max_chars: int = 6000) -> list[str]:
-    sentences = text.split(". ")
+def split_text_into_chunks(text: str, max_chars: int = 4500) -> list[str]:
+    sentences = text.replace("\n", " ").split(". ")
     chunks = []
     current_chunk = ""
     for sent in sentences:
@@ -39,80 +39,73 @@ def split_text_into_chunks(text: str, max_chars: int = 6000) -> list[str]:
         chunks.append(current_chunk.strip())
     return chunks
 
-def generate_summary_for_chunk(chunk: str, llm) -> str:
-    prompt = f"""Извлеки из фрагмента пары: "вопрос — итог".
-Если итога нет — напиши "без решения".
-Фрагмент: {chunk}
-Результат:"""
-    
-    messages = [
-        {"role": "user", "content": prompt}
-    ]
-    
-    output = llm.create_chat_completion(
-        messages=messages,
-        max_tokens=256,
-        temperature=0.0,
-        repeat_penalty=1.1
+def generate_summary(transcription_text: str, model_path: str) -> str:
+    llm = Llama(
+        model_path=model_path,
+        n_ctx=4096,
+        n_threads=12,
+        n_gpu_layers=0,
+        verbose=False
     )
-    return output["choices"][0]["message"]["content"].strip()
+    
+    chunks = split_text_into_chunks(transcription_text, max_chars=4500)
+    print(f"Разбито на {len(chunks)} фрагментов")
+    
+    if not chunks:
+        return "Пустая транскрибация."
+    
+    # Начинаем с пустого списка
+    current_summary = "Нет обсуждений."
+    
+    for i, chunk in enumerate(chunks):
+        print(f"Обработка фрагмента {i+1}/{len(chunks)}...")
+        
+        prompt = f"""Ты ведёшь протокол встречи. У тебя есть текущий протокол и новый фрагмент транскрипции.
+Добавь из фрагмента ТОЛЬКО новые пары "вопрос — итог".
+Если итога нет — пиши "без решения".
+Не повторяй уже существующие пункты.
 
-def generate_final_summary(summaries: list[str], llm) -> str:
-    # Фильтрация пустых и бессмысленных чанков
-    filtered_summaries = [
-        s for s in summaries 
-        if s and "нет" not in s.lower() and "пропусти" not in s.lower() and len(s) > 10
-    ]
-    
-    if not filtered_summaries:
-        return "Не удалось извлечь значимые обсуждения из транскрибации."
-    
-    combined = "\n".join(filtered_summaries)
-    
-    final_prompt = f"""Создай резюме встречи по шаблону. Используй ТОЛЬКО факты из текста. Не добавляй ничего от себя.
-
-ТЕМА ВСТРЕЧИ: [одна фраза]
-ОБСУЖДАЕМЫЕ ВОПРОСЫ:
+ФОРМАТ ВЫВОДА:
 - [вопрос]: [итог]
 
-Текст:
-{combined}
+ТЕКУЩИЙ ПРОТОКОЛ:
+{current_summary}
 
-Резюме:"""
+НОВЫЙ ФРАГМЕНТ:
+{chunk}
 
-    messages = [
-        {"role": "user", "content": final_prompt}
-    ]
+ОБНОВЛЁННЫЙ ПРОТОКОЛ:"""
+        
+        messages = [{"role": "user", "content": prompt}]
+        response = llm.create_chat_completion(
+            messages=messages,
+            max_tokens=512,
+            temperature=0.0,
+            repeat_penalty=1.1
+        )
+        current_summary = response["choices"][0]["message"]["content"].strip()
     
-    output = llm.create_chat_completion(
+    # Финальное оформление
+    final_prompt = f"""Преобразуй протокол в официальное резюме встречи.
+
+Протокол:
+{current_summary}
+
+Формат:
+ТЕМА ВСТРЕЧИ: [общая тема на основе вопросов]
+ОБСУЖДАЕМЫЕ ВОПРОСЫ:
+[список из протокола]
+
+ИТОГОВОЕ РЕЗЮМЕ:"""
+    
+    messages = [{"role": "user", "content": final_prompt}]
+    final_response = llm.create_chat_completion(
         messages=messages,
         max_tokens=768,
         temperature=0.0,
         repeat_penalty=1.1
     )
-    return output["choices"][0]["message"]["content"].strip()
-
-def generate_summary(transcription_text: str, model_path: str) -> str:
-    llm = Llama(
-        model_path=model_path,
-        n_ctx=4096,
-        n_threads=8,
-        n_gpu_layers=0,
-        verbose=False
-    )
-    
-    chunks = split_text_into_chunks(transcription_text, max_chars=6000)
-    print(f"Разбито на {len(chunks)} фрагментов")
-    
-    chunk_summaries = []
-    for i, chunk in enumerate(chunks):
-        print(f"Обработка фрагмента {i+1}/{len(chunks)}...")
-        summary = generate_summary_for_chunk(chunk, llm)
-        chunk_summaries.append(summary)
-    
-    print("Генерация итогового резюме по шаблону...")
-    final_summary = generate_final_summary(chunk_summaries, llm)
-    return final_summary
+    return final_response["choices"][0]["message"]["content"].strip()
 
 def save_summary(output_path: str, summary: str):
     Path(output_path).write_text(summary, encoding="utf-8")
