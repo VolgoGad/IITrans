@@ -1,0 +1,4 @@
+model/*
+data/*
+hf_cache/*
+.env

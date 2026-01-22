@@ -1,0 +1,20 @@
+services:
+  gigaam-transcriber:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: gigaam-transcriber-ggfu
+    volumes:
+      - ./:/app
+      - data_cache:/root/.cache
+    env_file:
+      - .env
+    command: ["python", "main.py", "data/input.mkv"]
+    network_mode: "host"
+    deploy:
+      resources:
+        reservations:
+          devices: []
+
+volumes:
+  data_cache:
