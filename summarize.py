@@ -3,7 +3,7 @@ import json
 from pathlib import Path
 from llama_cpp import Llama
 
-os.environ["CUDA_VISIBLE_DEVICES"] = ""
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 def get_transcription_text(file_path: str) -> str:
     if file_path.endswith(".json"):
@@ -55,54 +55,42 @@ def generate_summary(transcription_text: str, model_path: str) -> str:
         return "Пустая транскрибация."
     
     # Начинаем с пустого списка
-    current_summary = "Нет обсуждений."
+    current_summary = ""
     
     for i, chunk in enumerate(chunks):
         print(f"Обработка фрагмента {i+1}/{len(chunks)}...")
         
-        prompt = f"""Ты ведёшь протокол встречи. У тебя есть текущий протокол и новый фрагмент транскрипции.
-Добавь из фрагмента ТОЛЬКО новые пары "вопрос — итог".
-Если итога нет — пиши "без решения".
-Не повторяй уже существующие пункты.
-
-ФОРМАТ ВЫВОДА:
-- [вопрос]: [итог]
-
-ТЕКУЩИЙ ПРОТОКОЛ:
-{current_summary}
-
-НОВЫЙ ФРАГМЕНТ:
-{chunk}
-
-ОБНОВЛЁННЫЙ ПРОТОКОЛ:"""
+        prompt = f"Суммаризируй текст, сохраняя основные положения из предыдущего резюме:\n"
+        f"===Предыдущее резюме===\n{current_summary}"
+        f"===Текущий текст===\n{chunk}"
         
         messages = [{"role": "user", "content": prompt}]
         response = llm.create_chat_completion(
             messages=messages,
-            max_tokens=512,
-            temperature=0.0,
+            max_tokens=1024,
+            temperature=0.3,
             repeat_penalty=1.1
         )
         current_summary = response["choices"][0]["message"]["content"].strip()
     
     # Финальное оформление
-    final_prompt = f"""Преобразуй протокол в официальное резюме встречи.
+    final_prompt = f"""Ты секретарь, который ведет протокол встречи. Преобразуй протокол в официальное резюме встречи.
 
-Протокол:
+===Протокол===
 {current_summary}
 
-Формат:
+===Формат===
 ТЕМА ВСТРЕЧИ: [общая тема на основе вопросов]
 ОБСУЖДАЕМЫЕ ВОПРОСЫ:
 [список из протокола]
 
-ИТОГОВОЕ РЕЗЮМЕ:"""
+ИТОГОВОЕ РЕЗЮМЕ: [резюме]"""
     
     messages = [{"role": "user", "content": final_prompt}]
     final_response = llm.create_chat_completion(
         messages=messages,
-        max_tokens=768,
-        temperature=0.0,
+        max_tokens=1024,
+        temperature=0.3,
         repeat_penalty=1.1
     )
     return final_response["choices"][0]["message"]["content"].strip()
