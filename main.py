@@ -148,8 +148,8 @@ def process_video(
     docx_path = out_dir_path / f"{stem}.docx"
     json_path = out_dir_path / f"{stem}.json"
 
-    # print(f"[1/4] Extracting audio from {video_path} -> {wav_path}")
-    # extract_audio_from_mp4(video_path, str(wav_path))
+    print(f"[1/4] Extracting audio from {video_path} -> {wav_path}")
+    extract_audio_from_mp4(video_path, str(wav_path))
 
     print(f"[2/4] Loading GigaAM-v3 model (CPU mode)")
     model = load_gigaam_model()

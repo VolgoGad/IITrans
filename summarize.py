@@ -50,8 +50,8 @@ def generate_summary(transcription_text: str) -> str:
 
     print("[summary] Loading LLM model...", flush=True)
     llm = Llama.from_pretrained(
-        repo_id="Vikhrmodels/Vikhr-Qwen-2.5-1.5B-Instruct-GGUF",
-        filename="Vikhr-Qwen-2.5-1.5b-Instruct-Q8_0.gguf",
+        repo_id="IlyaGusev/saiga_llama3_8b_gguf",
+	    filename="model-q8_0.gguf",
         n_ctx=n_ctx,
     )
     print("[summary] Model loaded.", flush=True)
