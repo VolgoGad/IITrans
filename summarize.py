@@ -6,114 +6,164 @@ from llama_cpp import Llama
 from tqdm.auto import tqdm
 
 
+# ===============================
+# ЗАГРУЗКА ТРАНСКРИПЦИИ
+# ===============================
 def get_transcription_text(file_path: str) -> str:
     if file_path.endswith(".json"):
         data = json.loads(Path(file_path).read_text(encoding="utf-8"))
         return "\n".join(seg["text"] for seg in data if seg.get("text", "").strip())
+
     elif file_path.endswith(".txt"):
         lines = Path(file_path).read_text(encoding="utf-8").splitlines()
         texts = []
         for line in lines:
             if "] " in line:
-                parts = line.split("] ", 1)
-                if len(parts) == 2:
-                    texts.append(parts[1])
-                else:
-                    texts.append(line)
+                texts.append(line.split("] ", 1)[1])
             else:
                 texts.append(line)
         return "\n".join(texts)
+
     else:
         raise ValueError("Only .txt and .json supported")
 
-def split_text_into_chunks(text: str, max_chars: int = 4500) -> list[str]:
+
+# ===============================
+# ЧАНКИНГ
+# ===============================
+def split_text_into_chunks(text: str, max_chars: int = 4200) -> list[str]:
     sentences = text.replace("\n", " ").split(". ")
     chunks = []
-    current_chunk = ""
+    current = ""
+
     for sent in sentences:
-        if len(current_chunk) + len(sent) + 2 > max_chars and current_chunk:
-            chunks.append(current_chunk.strip())
-            current_chunk = sent + ". "
+        if len(current) + len(sent) > max_chars:
+            chunks.append(current.strip())
+            current = sent + ". "
         else:
-            current_chunk += sent + ". "
-    if current_chunk:
-        chunks.append(current_chunk.strip())
+            current += sent + ". "
+
+    if current.strip():
+        chunks.append(current.strip())
+
     return chunks
 
-def generate_summary(transcription_text: str) -> str:
-    # "Больше токенов" бывает двух типов:
-    # - n_ctx: размер контекстного окна модели (сколько токенов влезает во вход+выход)
-    # - max_tokens: сколько токенов генерировать в ответ
-    n_ctx = int(os.getenv("LLM_N_CTX", "4096"))
-    max_tokens_chunk = int(os.getenv("LLM_MAX_TOKENS_CHUNK", "1024"))
-    max_tokens_final = int(os.getenv("LLM_MAX_TOKENS_FINAL", "1024"))
 
-    print("[summary] Loading LLM model...", flush=True)
+# ===============================
+# СУММАРИЗАЦИЯ (CPU ONLY)
+# ===============================
+def generate_summary(transcription_text: str) -> str:
+    n_ctx = 4096
+
+    max_tokens_chunk = 256
+    max_tokens_compress = 256
+    max_tokens_final = 512
+
+    print("[summary] Loading LLM model (CPU only)...", flush=True)
+
     llm = Llama.from_pretrained(
-        repo_id="IlyaGusev/saiga_llama3_8b_gguf",
-	    filename="model-q8_0.gguf",
+        repo_id="ruslandev/llama-3-8b-gpt-4o-ru1.0-gguf",
+	    filename="ggml-model-Q2_K.gguf",   # ⚠️ КЛЮЧЕВО
         n_ctx=n_ctx,
+        n_threads=os.cpu_count(),       # использовать все ядра
     )
+
     print("[summary] Model loaded.", flush=True)
-    chunks = split_text_into_chunks(transcription_text, max_chars=4500)
+
+    chunks = split_text_into_chunks(transcription_text)
     print(f"[summary] Разбито на {len(chunks)} фрагментов", flush=True)
-    
+
     if not chunks:
         return "Пустая транскрибация."
-    
-    # Начинаем с пустого списка
-    current_summary = ""
-    
-    pbar = tqdm(
-        chunks,
-        desc="Summarizing",
-        unit="chunk",
-        file=sys.stdout,
-        dynamic_ncols=True,
-        mininterval=0.5,
-    )
-    for i, chunk in enumerate(pbar):
-        tqdm.write(f"[summary] Обработка фрагмента {i+1}/{len(chunks)}...")
-        
-        # IMPORTANT: build a single string (your previous version only kept the first line)
-        prompt = (
-            "Суммаризируй текст беседы, сохраняя основные положения из предыдущего резюме.\n"
-            "Выдели основные темы/вопросы и их решения.\n"
-            f"===Предыдущее резюме===\n{current_summary}\n"
-            f"===Текущий текст беседы===\n{chunk}"
-        )
-        
-        messages = [{"role": "user", "content": prompt}]
+
+    partial_summaries = []
+
+    # ===============================
+    # ЭТАП 1 — МИКРО-РЕЗЮМЕ
+    # ===============================
+    pbar = tqdm(chunks, desc="Summarizing", unit="chunk", file=sys.stdout)
+
+    for chunk in pbar:
+        prompt = f"""
+Кратко (5–7 пунктов) опиши содержание беседы.
+
+Правила:
+- только факты
+- темы, решения, договорённости
+- без воды
+
+Текст:
+{chunk}
+""".strip()
+
         response = llm.create_chat_completion(
-            messages=messages,
+            messages=[{"role": "user", "content": prompt}],
             max_tokens=max_tokens_chunk,
-            temperature=0.3,
-            repeat_penalty=1.1
+            temperature=0.2,
+            repeat_penalty=1.1,
         )
-        current_summary = response["choices"][0]["message"]["content"].strip()
-    
-    # Финальное оформление
-    final_prompt = f"""Ты секретарь, который ведет протокол встречи. Преобразуй протокол в официальное резюме встречи.
 
-===Протокол===
-{current_summary}
+        partial_summaries.append(
+            response["choices"][0]["message"]["content"].strip()
+        )
 
-===Формат===
-ТЕМА ВСТРЕЧИ: [общая тема на основе вопросов]
-ОБСУЖДАЕМЫЕ ВОПРОСЫ:
-[список из протокола]
+    # ===============================
+    # ЭТАП 2 — СЖАТИЕ
+    # ===============================
+    print("[summary] Compressing summaries...", flush=True)
 
-ИТОГОВОЕ РЕЗЮМЕ: [резюме]"""
-    # printing the entire final prompt can be huge; keep logs compact
-    print("[summary] Generating final formatted summary...", flush=True)
-    messages = [{"role": "user", "content": final_prompt}]
-    final_response = llm.create_chat_completion(
-        messages=messages,
-        max_tokens=max_tokens_final,
-        temperature=0.3,
-        repeat_penalty=1.1
+    compress_prompt = f"""
+Сожми информацию ниже в краткий протокол встречи.
+
+Оставь:
+- ключевые темы
+- принятые решения
+- договорённости
+
+Информация:
+{chr(10).join(partial_summaries)}
+""".strip()
+
+    response = llm.create_chat_completion(
+        messages=[{"role": "user", "content": compress_prompt}],
+        max_tokens=max_tokens_compress,
+        temperature=0.2,
+        repeat_penalty=1.1,
     )
+
+    compressed = response["choices"][0]["message"]["content"].strip()
+
+    # ===============================
+    # ЭТАП 3 — ФИНАЛ
+    # ===============================
+    print("[summary] Generating final summary...", flush=True)
+
+    final_prompt = f"""
+Ты секретарь, ведущий протокол встречи.
+Сформируй официальное резюме.
+
+=== ПРОТОКОЛ ===
+{compressed}
+
+=== ФОРМАТ ===
+ТЕМА ВСТРЕЧИ:
+ОБСУЖДАЕМЫЕ ВОПРОСЫ:
+ИТОГОВЫЕ РЕШЕНИЯ:
+ДОГОВОРЁННОСТИ:
+""".strip()
+
+    final_response = llm.create_chat_completion(
+        messages=[{"role": "user", "content": final_prompt}],
+        max_tokens=max_tokens_final,
+        temperature=0.2,
+        repeat_penalty=1.1,
+    )
+
     return final_response["choices"][0]["message"]["content"].strip()
 
+
+# ===============================
+# СОХРАНЕНИЕ
+# ===============================
 def save_summary(output_path: str, summary: str):
     Path(output_path).write_text(summary, encoding="utf-8")
