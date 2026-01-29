@@ -1,10 +1,41 @@
 import os
 import json
-import sys
 import re
+import torch
 from pathlib import Path
-from llama_cpp import Llama
+from transformers import GPT2Tokenizer, T5ForConditionalGeneration
 from tqdm.auto import tqdm
+
+
+# ===============================
+# КОНФИГУРАЦИЯ
+# ===============================
+MODEL_NAME = "RussianNLP/FRED-T5-Summarizer"
+DEVICE = "cpu"  # "cuda" если есть GPU
+MAX_CONTEXT_LENGTH = 1024  # лимит токенов для FRED-T5 (вход + выход)
+MAX_NEW_TOKENS_CHUNK = 200  # длина вывода для чанков
+MIN_NEW_TOKENS_CHUNK = 17
+MAX_NEW_TOKENS_FINAL = 400   # длина финального резюме
+MIN_NEW_TOKENS_FINAL = 100
+CHUNK_SIZE_CHARS = 800       # ~600-700 токенов после токенизации + запас на префикс
+OVERLAP_CHARS = 150
+
+
+# ===============================
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# ===============================
+def count_tokens(text: str, tokenizer) -> int:
+    """Подсчёт токенов с учётом специальных токенов."""
+    return len(tokenizer.encode(text, add_special_tokens=True))
+
+
+def truncate_to_max_tokens(text: str, tokenizer, max_tokens: int) -> str:
+    """Обрезка текста до заданного количества токенов."""
+    tokens = tokenizer.encode(text, add_special_tokens=False)
+    if len(tokens) <= max_tokens:
+        return text
+    truncated = tokenizer.decode(tokens[:max_tokens], skip_special_tokens=False)
+    return truncated
 
 
 # ===============================
@@ -17,318 +48,218 @@ def get_transcription_text(file_path: str) -> str:
     """
     if file_path.endswith(".json"):
         data = json.loads(Path(file_path).read_text(encoding="utf-8"))
-        return "\n".join(seg["text"] for seg in data if seg.get("text", "").strip())
+        return "\n".join(seg["text"].strip() for seg in data if seg.get("text", "").strip())
 
     elif file_path.endswith(".txt"):
         lines = Path(file_path).read_text(encoding="utf-8").splitlines()
         texts = []
         for line in lines:
-            # Обрезаем таймкоды вида: [00:00:01.000 - 00:00:05.000] Текст...
             if "] " in line:
-                texts.append(line.split("] ", 1)[1])
-            else:
-                texts.append(line)
+                texts.append(line.split("] ", 1)[1].strip())
+            elif line.strip():
+                texts.append(line.strip())
         return "\n".join(texts)
 
     else:
-        raise ValueError("Only .txt and .json supported")
+        raise ValueError("Поддерживаются только .txt и .json файлы")
 
 
 # ===============================
-# ЧАНКИНГ
+# ЧАНКИНГ С КОРРЕКТНЫМ ОВЕРЛАПОМ
 # ===============================
-def split_text_into_chunks(text: str, max_chars: int = 3500) -> list[str]:
+def split_text_into_chunks(text: str, max_chars: int = CHUNK_SIZE_CHARS, overlap: int = OVERLAP_CHARS) -> list[str]:
     """
-    Аккуратный разбор длинной транскрибации на чанки,
-    подходящие под контекст окна модели.
-
-    - Нормализует пробелы
-    - Делит по окончаниям предложений (.?!)
-    - Собирает предложения в чанки по ограничению символов
+    Разбивает текст на чанки с фиксированным оверлапом по символам.
     """
-    # Нормализация пробелов и переводов строк
+    # Нормализация пробелов
     normalized = re.sub(r"\s+", " ", text.strip())
-
-    # Делим по концам предложений, но сохраняем знак препинания
-    sentences = re.split(r"(?<=[\.\?\!])\s+", normalized)
-
-    chunks: list[str] = []
-    current: list[str] = []
-    current_len = 0
-
-    for sent in sentences:
-        if not sent:
+    
+    # Делим по предложениям с поддержкой русской пунктуации
+    sentences = re.split(r'(?<=[.!?…])\s+', normalized)
+    
+    chunks = []
+    current_chunk = []
+    current_length = 0
+    
+    for sentence in sentences:
+        if not sentence.strip():
             continue
-
-        sent_len = len(sent) + 1  # +1 за пробел/разделитель
-        if current and current_len + sent_len > max_chars:
-            chunks.append(" ".join(current).strip())
-            current = [sent]
-            current_len = sent_len
+            
+        sentence_length = len(sentence) + 1  # +1 для пробела
+        
+        if current_chunk and current_length + sentence_length > max_chars:
+            # Сохраняем текущий чанк
+            chunk_text = ' '.join(current_chunk)
+            chunks.append(chunk_text.strip())
+            
+            # Рассчитываем оверлап по символам
+            if overlap > 0 and chunk_text:
+                overlap_text = chunk_text[-overlap:].strip()
+                # Находим последнюю границу предложения в оверлапе
+                overlap_sentences = re.split(r'(?<=[.!?…])\s+', overlap_text)
+                if len(overlap_sentences) > 1:
+                    overlap_text = ' '.join(overlap_sentences[1:])  # пропускаем неполное предложение
+                
+                current_chunk = [overlap_text, sentence] if overlap_text else [sentence]
+                current_length = len(overlap_text) + 1 + len(sentence)
+            else:
+                current_chunk = [sentence]
+                current_length = len(sentence)
         else:
-            current.append(sent)
-            current_len += sent_len
-
-    if current:
-        chunks.append(" ".join(current).strip())
-
+            current_chunk.append(sentence)
+            current_length += sentence_length
+    
+    # Добавляем последний чанк
+    if current_chunk:
+        chunks.append(' '.join(current_chunk).strip())
+    
     return chunks
 
 
-def _chunk_list_by_length(items: list[str], max_chars: int) -> list[list[str]]:
+# ===============================
+# СУММАРИЗАЦИЯ ЧАНКА
+# ===============================
+def summarize_chunk(chunk: str, model, tokenizer, device) -> str:
     """
-    Хелпер для иерархической компрессии:
-    группирует строки в пачки так, чтобы суммарная длина
-    каждой пачки не превышала max_chars.
+    Суммаризует один чанк с правильным форматированием для FRED-T5.
     """
-    batches: list[list[str]] = []
-    current: list[str] = []
-    current_len = 0
-
-    for item in items:
-        if not item:
-            continue
-
-        item_len = len(item) + 1  # +1 за разделитель между блоками
-        if current and current_len + item_len > max_chars:
-            batches.append(current)
-            current = [item]
-            current_len = item_len
-        else:
-            current.append(item)
-            current_len += item_len
-
-    if current:
-        batches.append(current)
-
-    return batches
+    # Обязательный префикс для FRED-T5
+    input_text = f"<LM> Сократи текст.\n {chunk.strip()}"
+    
+    # Токенизация с обрезкой до лимита контекста
+    input_ids = tokenizer(
+        input_text,
+        return_tensors="pt",
+        truncation=True,
+        max_length=MAX_CONTEXT_LENGTH - MAX_NEW_TOKENS_CHUNK  # оставляем место для вывода
+    ).input_ids.to(device)
+    
+    # Генерация
+    with torch.no_grad():
+        outputs = model.generate(
+            input_ids,
+            eos_token_id=tokenizer.eos_token_id,
+            max_new_tokens=MAX_NEW_TOKENS_CHUNK,
+            min_new_tokens=MIN_NEW_TOKENS_CHUNK,
+            num_beams=5,
+            do_sample=True,
+            top_p=0.9,
+            no_repeat_ngram_size=4,
+            early_stopping=True
+        )
+    
+    # Декодирование (пропускаем первый токен — обычно <pad>)
+    summary = tokenizer.decode(outputs[0][1:], skip_special_tokens=True)
+    return summary.strip()
 
 
 # ===============================
-# СУММАРИЗАЦИЯ (CPU ONLY)
+# ФИНАЛЬНАЯ СУММАРИЗАЦИЯ
+# ===============================
+def create_final_summary(combined_text: str, model, tokenizer, device) -> str:
+    """
+    Создаёт структурированное финальное резюме.
+    Важно: промпт должен умещаться в контекстное окно!
+    """
+    # Упрощённый промпт (длинные инструкции превысят лимит 1024 токена)
+    prompt = f"<LM> Сделай краткое структурированное резюме обсуждения.\n {combined_text.strip()}"
+    
+    # Проверка и обрезка до безопасного размера
+    if count_tokens(prompt, tokenizer) > MAX_CONTEXT_LENGTH - MIN_NEW_TOKENS_FINAL:
+        max_input_tokens = MAX_CONTEXT_LENGTH - MAX_NEW_TOKENS_FINAL - 50  # запас на префикс
+        prompt = f"<LM> Сделай краткое структурированное резюме обсуждения.\n {truncate_to_max_tokens(combined_text, tokenizer, max_input_tokens)}"
+        print(f"[!] Финальный текст обрезан до {max_input_tokens} токенов для умещения в контекст")
+    
+    input_ids = tokenizer(
+        prompt,
+        return_tensors="pt",
+        truncation=True,
+        max_length=MAX_CONTEXT_LENGTH - MAX_NEW_TOKENS_FINAL
+    ).input_ids.to(device)
+    
+    with torch.no_grad():
+        outputs = model.generate(
+            input_ids,
+            eos_token_id=tokenizer.eos_token_id,
+            max_new_tokens=MAX_NEW_TOKENS_FINAL,
+            min_new_tokens=MIN_NEW_TOKENS_FINAL,
+            num_beams=5,
+            do_sample=True,
+            top_p=0.9,
+            no_repeat_ngram_size=4,
+            early_stopping=True
+        )
+    
+    summary = tokenizer.decode(outputs[0][1:], skip_special_tokens=True)
+    return summary.strip()
+
+
+# ===============================
+# ОСНОВНАЯ ФУНКЦИЯ СУММАРИЗАЦИИ
 # ===============================
 def generate_summary(transcription_text: str) -> str:
-    n_ctx = 4096
-
-    # Чуть увеличиваем лимиты генерации,
-    # чтобы модель могла удержать больше тем и деталей.
-    max_tokens_chunk = 384
-    max_tokens_compress = 768
-    max_tokens_final = 1024
-
-    print("[summary] Loading LLM model (CPU only)...", flush=True)
-
-    llm = Llama.from_pretrained(
-        repo_id="ruslandev/llama-3-8b-gpt-4o-ru1.0-gguf",
-        filename="ggml-model-Q2_K.gguf",
-        n_ctx=n_ctx,
-        n_threads=os.cpu_count(),
-    )
-
-    print("[summary] Model loaded.", flush=True)
-
-    # 1. Разбиваем длинную транскрибацию на текстовые чанки
-    chunks = split_text_into_chunks(transcription_text)
-    print(f"[summary] Разбито на {len(chunks)} фрагментов", flush=True)
-
+    """
+    Полный пайплайн суммаризации с иерархическим подходом.
+    """
+    print("[summary] Загрузка модели FRED-T5...")
+    
+    # Загрузка правильного токенизатора (на базе GPT-2)
+    tokenizer = GPT2Tokenizer.from_pretrained(MODEL_NAME, eos_token='</s>')
+    model = T5ForConditionalGeneration.from_pretrained(MODEL_NAME)
+    model.to(DEVICE)
+    model.eval()  # режим инференса
+    
+    print(f"[summary] Модель загружена. Устройство: {DEVICE.upper()}")
+    
+    # 1. Разбиваем на чанки
+    chunks = split_text_into_chunks(transcription_text, max_chars=CHUNK_SIZE_CHARS, overlap=OVERLAP_CHARS)
+    print(f"[summary] Текст разбит на {len(chunks)} чанков")
+    
     if not chunks:
-        return "Пустая транскрибация."
-
-    partial_summaries: list[str] = []
-
-    # ===============================
-    # ЭТАП 1 — ТОЧНАЯ ФИКСАЦИЯ ФАКТОВ ПО ТЕМАМ
-    # ===============================
-    pbar = tqdm(chunks, desc="Summarizing", unit="chunk", file=sys.stdout)
-
-    for chunk in pbar:
-        prompt = f"""
-Зафиксируй ФАКТЫ и ОТДЕЛЬНЫЕ ТЕМЫ из этого фрагмента встречи.
-
-СТРОГИЕ ПРАВИЛА:
-- НЕ обобщай
-- НЕ используй слова: "обсуждали", "рассматривали", "поговорили"
-- Пиши максимально близко к тексту
-- Если нет решений — напиши: "Решений не зафиксировано"
-- НИЧЕГО не добавляй от себя
-
-НУЖНО ВЫДЕЛИТЬ:
-- для КАЖДОЙ ОТДЕЛЬНОЙ ТЕМЫ/ВОПРОСА:
-  - краткое название темы
-  - конкретные высказывания
-  - пояснения
-  - варианты решений (если были)
-  - принятые решения
-  - договорённости и следующие шаги
-  - замечания и уточнения
-
-ФОРМАТ:
-- Тема: <краткое название>
-  - Факт: ...
-  - Факт: ...
-  - Решение: ...
-  - Договорённость: ...
-- Тема: <краткое название>
-  - ...
-
-ТЕКСТ:
-{chunk}
-""".strip()
-
-        response = llm.create_chat_completion(
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=max_tokens_chunk,
-            temperature=0.1,
-            repeat_penalty=1.15,
-        )
-
-        partial_summaries.append(
-            response["choices"][0]["message"]["content"].strip()
-        )
-
-    # ===============================
-    # ЭТАП 2 — КОНСОЛИДАЦИЯ БЕЗ ВОДЫ (ИЕРАРХИЧЕСКАЯ, С СОХРАНЕНИЕМ ВСЕХ ТЕМ)
-    # ===============================
-    print("[summary] Compressing summaries...", flush=True)
-
-    # Сначала сжимаем чанки частичных саммари партиями,
-    # чтобы не переполнить контекст модели на длинных встречах.
-    # 6000–7000 символов текста записей + промпт ≈ безопасно для n_ctx=4096.
-    first_level_batches = _chunk_list_by_length(partial_summaries, max_chars=6500)
-    first_level_protocols: list[str] = []
-
-    for batch in tqdm(
-        first_level_batches,
-        desc="Compressing level-1",
-        unit="batch",
-        file=sys.stdout,
-    ):
-        compress_prompt = f"""
-На основе записей ниже составь СТРОГИЙ ПРОТОКОЛ ВСТРЕЧИ,
-СГРУППИРОВАННЫЙ ПО ТЕМАМ/ВОПРОСАМ.
-
-ЖЁСТКИЕ ТРЕБОВАНИЯ:
-- Используй ТОЛЬКО информацию из текста
-- НЕ придумывай
-- НЕ используй общие формулировки
-- Объедини повторы ВНУТРИ одной и той же темы,
-  но НЕ смешивай разные темы в одну
-- Сохрани ВСЕ обсуждаемые темы, даже второстепенные
-- Если блок пуст — НЕ ВЫВОДИ его
-
-СТРУКТУРА:
-ТЕМА: <краткое название темы>
-- Вопрос: ...
-- Ключевые аргументы и факты: ...
-- Принятое решение: ... (или "Решение не принято")
-- Договорённости и следующие шаги: ...
-
-ТЕМА: <краткое название темы>
-- Вопрос: ...
-- Ключевые аргументы и факты: ...
-- Принятое решение: ...
-- Договорённости и следующие шаги: ...
-
-ЗАПИСИ:
-{chr(10).join(batch)}
-""".strip()
-
-        response = llm.create_chat_completion(
-            messages=[{"role": "user", "content": compress_prompt}],
-            max_tokens=max_tokens_compress,
-            temperature=0.1,
-            repeat_penalty=1.15,
-        )
-
-        first_level_protocols.append(
-            response["choices"][0]["message"]["content"].strip()
-        )
-
-    # Если батч всего один — уже есть финальный протокол.
-    if len(first_level_protocols) == 1:
-        compressed = first_level_protocols[0]
-    else:
-        # Иначе делаем ещё один проход консолидации
-        print("[summary] Consolidating compressed summaries...", flush=True)
-        second_level_prompt = f"""
-На основе протоколов ниже составь ЕДИНЫЙ СВОДНЫЙ ПРОТОКОЛ ВСТРЕЧИ,
-СОХРАНЯЮЩИЙ ВСЕ ТЕМЫ/ВОПРОСЫ.
-
-ЖЁСТКИЕ ТРЕБОВАНИЯ:
-- Используй ТОЛЬКО информацию из текста
-- НЕ придумывай
-- Объедини повторы и противоречия ВНУТРИ одной темы,
-  но НЕ сливай разные темы в одну
-- Сохрани все темы, даже если они кажутся менее важными
-- Если блок пуст — НЕ ВЫВОДИ его
-
-СТРУКТУРА:
-ТЕМА: <краткое название темы>
-- Вопрос: ...
-- Ключевые аргументы и факты: ...
-- Принятое решение: ... (или "Решение не принято")
-- Договорённости и следующие шаги: ...
-
-ПРОТОКОЛЫ:
-{chr(10).join(first_level_protocols)}
-""".strip()
-
-        response = llm.create_chat_completion(
-            messages=[{"role": "user", "content": second_level_prompt}],
-            max_tokens=max_tokens_compress,
-            temperature=0.1,
-            repeat_penalty=1.15,
-        )
-
-        compressed = response["choices"][0]["message"]["content"].strip()
-
-    # ===============================
-    # ЭТАП 3 — РЕЗЮМЕ КАК ОТ АНАЛИТИКА
-    # ===============================
-    print("[summary] Generating final summary...", flush=True)
-
-    final_prompt = f"""
-Ты опытный бизнес-аналитик и секретарь встречи.
-
-На основе ПРОТОКОЛА ниже составь РЕЗЮМЕ ВСТРЕЧИ.
-
-СТРОГИЕ ПРАВИЛА:
-- НЕ выдумывай
-- НЕ добавляй интерпретаций
-- Пиши конкретно и деловым языком
-- Резюме должно быть понятно руководству
-- Если информации для блока нет — НЕ ВЫВОДИ его
-
-ФОРМАТ РЕЗЮМЕ:
-
-ТЕМА ВСТРЕЧИ:
-(сформулируй по фактическому содержанию)
-
-ОБСУЖДАЕМЫЕ ВОПРОСЫ:
-- вопрос → суть
-
-ПРИНЯТЫЕ РЕШЕНИЯ:
-- решение → по какому вопросу
-
-ДОГОВОРЁННОСТИ И СЛЕДУЮЩИЕ ШАГИ:
-- кто → что должен сделать → при каких условиях
-
-ПРОТОКОЛ:
-{compressed}
-""".strip()
-
-    final_response = llm.create_chat_completion(
-        messages=[{"role": "user", "content": final_prompt}],
-        max_tokens=max_tokens_final,
-        temperature=0.1,
-        repeat_penalty=1.15,
-    )
-
-    return final_response["choices"][0]["message"]["content"].strip()
+        return "Ошибка: пустая транскрибация."
+    
+    # 2. Суммаризация каждого чанка
+    print("[summary] Этап 1: Суммаризация чанков...")
+    chunk_summaries = []
+    
+    for i, chunk in enumerate(tqdm(chunks, desc="Чанки", unit="шт")):
+        try:
+            summary = summarize_chunk(chunk, model, tokenizer, DEVICE)
+            chunk_summaries.append(summary)
+        except Exception as e:
+            print(f"\nОшибка при обработке чанка {i}: {e}")
+            # Fallback: короткий выдержка из чанка
+            chunk_summaries.append(f"Краткое содержание: {chunk[:150]}...")
+    
+    # 3. Объединение промежуточных резюме
+    print("[summary] Этап 2: Объединение промежуточных резюме...")
+    combined_summaries = " ".join(chunk_summaries)
+    
+    # При необходимости — промежуточное сжатие
+    if count_tokens(combined_summaries, tokenizer) > 700:
+        print("[summary] Промежуточное сжатие объединённого текста...")
+        combined_summaries = summarize_chunk(combined_summaries, model, tokenizer, DEVICE)
+    
+    # 4. Финальная суммаризация
+    print("[summary] Этап 3: Финальное структурированное резюме...")
+    final_summary = create_final_summary(combined_summaries, model, tokenizer, DEVICE)
+    
+    # Очистка памяти
+    del model
+    if DEVICE == "cuda":
+        torch.cuda.empty_cache()
+    
+    return final_summary
 
 
 # ===============================
-# СОХРАНЕНИЕ
+# СОХРАНЕНИЕ РЕЗУЛЬТАТА
 # ===============================
 def save_summary(output_path: str, summary: str):
+    """
+    Сохраняет резюме в файл.
+    """
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     Path(output_path).write_text(summary, encoding="utf-8")
+    print(f"[summary] Резюме сохранено: {output_path}")
+
