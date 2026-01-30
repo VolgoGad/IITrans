@@ -174,7 +174,8 @@ def process_video(
         transcription_for_summary = str(json_path) if save_json else str(txt_path)
         full_text = get_transcription_text(transcription_for_summary)
         summary = generate_summary(
-            transcription_text=full_text
+            transcription_text=full_text,
+            file_path=transcription_for_summary,
         )
         save_summary(str(summary_txt_path), summary)
         print(f"SUMMARY saved to: {summary_txt_path}")
