@@ -458,7 +458,6 @@ def format_structured_summary(themes: list[dict]) -> str:
     """
     blocks = []
     for i, th in enumerate(themes, 1):
-        title = theme_title_from_keywords(th["title_keywords"])
         obs = th.get("obsuzdalos") or "Обсуждение по теме."
         res = th.get("result")
         if not res:
@@ -469,7 +468,7 @@ def format_structured_summary(themes: list[dict]) -> str:
             actions = ["Нет назначенных действий."]
 
         block = [
-            f"ТЕМА {i}: {title}",
+            f"ТЕМА {i}",
             f"- Обсуждалось: {obs}",
             f"- Результат: {res}",
             "- Действия:",
