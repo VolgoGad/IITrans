@@ -22,11 +22,13 @@ from tqdm.auto import tqdm
 MODEL_NAME = "RussianNLP/FRED-T5-Summarizer"
 DEVICE = "cpu"
 MAX_CONTEXT_LENGTH = 1024
-MAX_NEW_TOKENS_THEME = 150
-MIN_NEW_TOKENS_THEME = 30
-MIN_THEME_WORDS = 400
+MAX_NEW_TOKENS_THEME = 220
+MIN_NEW_TOKENS_THEME = 80
+MAX_NEW_TOKENS_ACTIONS = 120
+MIN_NEW_TOKENS_ACTIONS = 10
+MIN_THEME_WORDS = 250
 MAX_THEME_WORDS = 3000
-MAX_THEMES_OUTPUT = 5
+MAX_THEMES_OUTPUT = 8
 PAUSE_THRESHOLD_SEC = 3.0
 WINDOW_SENTENCES = 5
 KEYWORD_SIMILARITY_THRESHOLD = 0.4
@@ -342,8 +344,10 @@ def summarize_theme_t5(topic_text: str, model, tokenizer, device: str) -> tuple[
     Возвращает (обсуждалось, результат) для темы. Короткий промпт, только факты.
     """
     prefix = (
-        "<LM> Кратко по тексту: что обсуждалось (1–2 предложения) и к чему пришли (итог, решение). "
-        "Только факты из текста, без имён. Текст:\n "
+        "<LM> Составь подробное резюме фрагмента встречи. "
+        "Сначала опиши, что именно обсуждалось (2–4 предложения, с перечислением ключевых аргументов, фактов, цифр и вариантов). "
+        "Затем опиши итог/решение (1–3 предложения, с акцентом на конкретные договорённости). "
+        "Не придумывай, используй только факты из текста, без имён участников. Текст:\n "
     )
     max_input = MAX_CONTEXT_LENGTH - count_tokens(prefix, tokenizer) - MAX_NEW_TOKENS_THEME - 50
     raw = truncate_to_max_tokens(topic_text, tokenizer, max(100, max_input))
@@ -391,6 +395,44 @@ def summarize_theme_t5(topic_text: str, model, tokenizer, device: str) -> tuple[
     if not res:
         res = "Обмен мнениями, решение не зафиксировано."
     return obs, res
+
+
+def extract_actions_t5(topic_text: str, model, tokenizer, device: str) -> list[str]:
+    """
+    Извлекает действия/поручения с ответственными в формате:
+    Имя - что должен сделать (кратко).
+    """
+    prefix = (
+        "<LM> Извлеки из текста конкретные задачи и поручения. "
+        "Верни только список строк в формате: Имя - что должен сделать (кратко). "
+        "Если ответственный явно не указан, используй 'Не назначено' как имя. "
+        "Не добавляй пояснений, вводных фраз и лишнего текста, только задачи, по одной на строке. Текст:\n "
+    )
+    max_input = MAX_CONTEXT_LENGTH - count_tokens(prefix, tokenizer) - MAX_NEW_TOKENS_ACTIONS - 50
+    raw = truncate_to_max_tokens(topic_text, tokenizer, max(100, max_input))
+    full = prefix + raw
+    input_ids = tokenizer(
+        full,
+        return_tensors="pt",
+        truncation=True,
+        max_length=MAX_CONTEXT_LENGTH - MAX_NEW_TOKENS_ACTIONS,
+    ).input_ids.to(device)
+
+    with torch.no_grad():
+        out = model.generate(
+            input_ids,
+            eos_token_id=tokenizer.eos_token_id,
+            max_new_tokens=MAX_NEW_TOKENS_ACTIONS,
+            min_new_tokens=MIN_NEW_TOKENS_ACTIONS,
+            num_beams=4,
+            do_sample=False,
+            no_repeat_ngram_size=3,
+            early_stopping=True,
+        )
+    text = tokenizer.decode(out[0][1:], skip_special_tokens=True).strip()
+    lines = [re.sub(r"\s+", " ", ln).strip(" •-*—\t") for ln in text.splitlines()]
+    lines = [ln for ln in lines if len(ln) > 5]
+    return _deduplicate_lines(lines)
 
 
 def _deduplicate_lines(lines: list[str]) -> list[str]:
@@ -473,10 +515,14 @@ def generate_summary(transcription_text: str, file_path: str | None = None) -> s
     for topic_text in tqdm(topics, desc="Темы", unit="шт"):
         ana = analyze_topic(topic_text)
         obs, res = summarize_theme_t5(topic_text, model, tokenizer, DEVICE)
+        # Действия формируем через T5 в формате [Имя] - [что сделать],
+        # при отсутствии — используем эвристическое извлечение как запасной вариант.
+        actions_llm = extract_actions_t5(topic_text, model, tokenizer, DEVICE)
+        actions = actions_llm if actions_llm else ana["actions"]
         themes_data.append({
             "title_keywords": ana["title_keywords"],
             "decisions": ana["decisions"],
-            "actions": ana["actions"],
+            "actions": actions,
             "obsuzdalos": obs,
             "result": res,
         })
